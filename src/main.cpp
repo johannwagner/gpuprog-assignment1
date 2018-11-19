@@ -42,7 +42,7 @@ typedef struct {
 
 // initalization is ensured by zero intialization
 const int MaxBarriers = 10;
-const int NumberOfThreads = 16;
+const int NumberOfThreads = 8;
 
 std::atomic<int> barrier_counter[MaxBarriers];
 std::mutex mutex_barrier[MaxBarriers];
@@ -75,9 +75,6 @@ readMat(const std::string &fname, const int nmat, std::vector<double> &mat) {
 
 void multiplyMatricesThread(MatrixMultiplicationThreadParams *threadParams) {
     size_t topMatrixIterations = threadParams->topMatrix.size() / threadParams->topMatrixDimensionSize;
-
-    std::cout << "Calculating workload from " << threadParams->resultVectorEntry << " to " << threadParams->resultVectorEntry + threadParams->resultVectorEntriesToCalculate << std::endl;
-    std::cout << "resultVector.size() = " << threadParams->resultVector.size() << std::endl;
 
     for (size_t i = threadParams->resultVectorEntry;
          i < threadParams->resultVectorEntry + threadParams->resultVectorEntriesToCalculate; i++) {
@@ -117,19 +114,11 @@ multiplyMatricesThreaded(std::vector<double> &leftVector, std::vector<double> &t
                 topMatrixDimensionSize
         };
 
-
-        std::cout << "Creating Thread " << i << " with " << numberToCalculate << " workloads" << std::endl;
-
         threads.emplace_back(std::thread(multiplyMatricesThread, threadParams));
     }
 
-    std::cout << "Created all threads, joining them now." << std::endl;
-
-
     for (int i = 0; i < NumberOfThreads; i++) {
-        std::cout << "Joining.." << std::endl;
         threads[i].join();
-        std::cout << "Joined.." << std::endl;
     }
 
     return resultVector;
@@ -227,8 +216,6 @@ verifyStationary(const int nmat, std::vector<double> &mat, std::vector<double> &
     double err = 0.;
     for (int i = 0; i < (int) temp.size(); ++i) {
 
-        std::cout << "temp[i] = " << temp[i] << std::endl;
-        std::cout << "stationary[i] = " << stationary[i] << std::endl;
         err += std::abs(temp[i] - stationary[i]);
     }
 
@@ -264,9 +251,6 @@ powerIterationSerial(const int num_iterations, const int nmat,
 
     for (int i = 0; i < num_iterations; i++) {
 
-        std::cout << "Iteration = " << i << std::endl;
-
-
         auto resultingVector = multiplyMatrices(stationary, mat, nmat);
         auto unnormedVectorSize = computeNorm(resultingVector);
         applyNorm(resultingVector, unnormedVectorSize);
@@ -278,10 +262,7 @@ powerIterationSerial(const int num_iterations, const int nmat,
 
     }
 
-    // TODO: implement power iteration
-
     double time = std::chrono::duration_cast<TimeT>(std::chrono::steady_clock::now() - start).count();
-
     return time;
 }
 
@@ -300,7 +281,6 @@ powerIterationParallel(const int num_iterations, const int nmat,
 
     for (int i = 0; i < num_iterations; i++) {
 
-        std::cout << "Iteration = " << i << std::endl;
 
 
         auto resultingVector = multiplyMatricesThreaded(stationary, mat, nmat);
@@ -326,13 +306,75 @@ powerIterationParallel(const int num_iterations, const int nmat,
 //! @mat   matrix (row-major order)
 //! @stationary  stationary vector to be computed
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+const int powerIterationBarrierId = 6;
+const int powerIterationBarrierIdSync = 1;
+
+void
+powerIterationParallelBarrierThread(int thId, const int numberOfIterations, const int nmat, std::vector<double> &mat,
+                                    std::vector<double> &stationary, std::vector<double> &resultVector) {
+
+    size_t numberToCalculate = (stationary.size() / NumberOfThreads);
+
+    for (int iter = 0; iter < numberOfIterations; iter++) {
+
+
+
+        auto *threadParams = new MatrixMultiplicationThreadParams{
+                resultVector,
+                thId * numberToCalculate,
+                numberToCalculate,
+                stationary,
+                mat,
+                nmat
+        };
+
+        multiplyMatricesThread(threadParams);
+
+        /**
+         * We need to sync the threads multiple times.
+         */
+        barrier(powerIterationBarrierId, NumberOfThreads);
+
+
+        if (thId == 0) {
+
+            // Do the magic trick.
+
+            auto unnormedVectorSize = computeNorm(resultVector);
+            applyNorm(resultVector, unnormedVectorSize);
+
+
+            for (size_t j = 0; j < resultVector.size(); j++) {
+                stationary[j] = resultVector[j];
+            }
+
+        }
+
+        barrier(powerIterationBarrierIdSync, NumberOfThreads);
+
+    }
+}
+
 double
 powerIterationParallelBarrier(const int num_iterations, const int nmat,
                               std::vector<double> &mat, std::vector<double> &stationary) {
 
     auto start = std::chrono::steady_clock::now();
+    std::vector<std::thread> threads;
 
-    // TODO: implement power iteration in parallel without restarting threads every iteration
+    std::vector<double> resultVector(stationary.size());
+
+
+    for (int thId = 0; thId < NumberOfThreads; thId++) {
+        threads.emplace_back(
+                std::thread(powerIterationParallelBarrierThread, thId, num_iterations, std::ref(nmat), std::ref(mat),
+                            std::ref(stationary), std::ref(resultVector)));
+    }
+
+    for (auto &thread : threads) {
+        thread.join();
+    }
 
     double time = std::chrono::duration_cast<TimeT>(std::chrono::steady_clock::now() - start).count();
 
@@ -346,41 +388,55 @@ int
 main(int /*argc*/, char ** /*argv*/) {
 
     // grid resolution to use
-    const int ntheta = 64;
-    const int nphi = 128;
+    const int ntheta = 2;
+    const int nphi = 4;
     const int nmat = ntheta * nphi;
 
     // load transition matrix
     std::vector<double> mat;
     std::stringstream fname;
     fname << "./data/mat_" << ntheta << "x" << nphi << ".dat";
+
     readMat(fname.str(), nmat, mat);
 
 
     std::vector<double> stationary(nmat);
     initializeStationary(stationary);
 
-    std::cout << "mat.size() = " << mat.size() << std::endl;
-    std::cout << "stationary.size() = " << stationary.size() << std::endl;
 
-
-    //double timeserial = powerIterationSerial(10, nmat, mat, stationary);
-    //std::cout << "time serial = " << timeserial << " ms." << std::endl;
-
-    //auto error = verifyStationary(nmat, mat, stationary);
-    //std::cout << "error = " << error << std::endl;
-
-
-    double timeparallel = powerIterationParallel(10, nmat, mat, stationary);
-    std::cout << "time parallel = " << timeparallel << " ms." << std::endl;
+    double timeserial = powerIterationSerial(10, nmat, mat, stationary);
+    std::cout << "time serial = " << timeserial << " ms." << std::endl;
 
     auto error = verifyStationary(nmat, mat, stationary);
     std::cout << "error = " << error << std::endl;
 
+    if(error > 1) {
+        std::cerr<< "Error condition was not met.";
+    }
 
-    std::vector<double> stationary_barrier;
-    double timebarrier = powerIterationParallelBarrier(50, nmat, mat, stationary_barrier);
+    initializeStationary(stationary);
+
+    double timeparallel = powerIterationParallel(10, nmat, mat, stationary);
+    std::cout << "time parallel = " << timeparallel << " ms." << std::endl;
+
+    auto errorParallel = verifyStationary(nmat, mat, stationary);
+    std::cout << "errorParallel = " << errorParallel << std::endl;
+
+    if(errorParallel > 1) {
+        std::cerr<< "Error condition was not met.";
+    }
+
+    initializeStationary(stationary);
+
+    double timebarrier = powerIterationParallelBarrier(10, nmat, mat, stationary);
     std::cout << "time barrier = " << timebarrier << " ms." << std::endl;
+
+    auto errorBarrier = verifyStationary(nmat, mat, stationary);
+    std::cout << "errorBarrier = " << errorBarrier << std::endl;
+
+    if(errorBarrier > 1) {
+        std::cerr<< "Error condition was not met.";
+    }
 
 
 }
